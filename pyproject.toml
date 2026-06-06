@@ -1,0 +1,16 @@
+[project]
+name = "marimoplayground"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "marimo>=0.23.8",
+    "numpy",
+    "altair",
+    "networkx",
+    "pandas",
+    "pyarrow",
+    "pyvis",
+    "anywidget",
+]
