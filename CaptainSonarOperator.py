@@ -192,6 +192,7 @@ def _models():
         target_r: Optional[int] = None
         target_c: Optional[int] = None
         sector: Optional[int] = None
+        result: Optional[bool] = None
 
     @dataclass(frozen=True)
     class PathBranch:
@@ -248,6 +249,28 @@ def _filters(MapContext):
             if filtered:
                 abs_pos = filtered
         return abs_pos
+
+    def filter_row_hit(starts: frozenset, rx: int, ry: int, row: int, hit: bool) -> frozenset:
+        """Keep positions where absolute row matches hit (True=yes, False=no). Soft mask."""
+        result = frozenset((r0, c0) for r0, c0 in starts if ((r0 - ry) == row) == hit)
+        return result if result else starts
+
+    def filter_col_hit(starts: frozenset, rx: int, ry: int, col: int, hit: bool) -> frozenset:
+        """Keep positions where absolute col matches hit. Soft mask."""
+        result = frozenset((r0, c0) for r0, c0 in starts if ((c0 + rx) == col) == hit)
+        return result if result else starts
+
+    def filter_sector_hit(starts: frozenset, rx: int, ry: int,
+                           sector: int, ctx: MapContext, hit: bool) -> frozenset:
+        """Keep positions where absolute cell is inside sector, matching hit. Soft mask."""
+        if sector not in ctx.sectors:
+            return starts
+        sr, sc = ctx.sectors[sector]
+        def _in(r0, c0):
+            r, c = r0 - ry, c0 + rx
+            return sr <= r < sr + 5 and sc <= c < sc + 5
+        result = frozenset((r0, c0) for r0, c0 in starts if _in(r0, c0) == hit)
+        return result if result else starts
 
     return carry_forward, filter_torpedo_range, filter_valid_starts
 
@@ -364,6 +387,48 @@ def _reducer(
                             nodes.append({"x": b.rx, "y": b.ry, "step": step,
                                           "fork_id": str(b.fork_id), "generation": str(b.generation),
                                           "ability": icon})
+
+            case "feedback":
+                new_branches = []
+                for b in branches:
+                    if event.name == "sonar":
+                        icon = _ICON["sonar"]
+                        if event.target_r is not None:
+                            raw = frozenset(
+                                (r0, c0) for r0, c0 in b.valid_starts
+                                if ((r0 - b.ry) == event.target_r) == event.result
+                            )
+                            label = f"Sonar row {event.target_r + 1}"
+                        elif event.target_c is not None:
+                            raw = frozenset(
+                                (r0, c0) for r0, c0 in b.valid_starts
+                                if ((c0 + b.rx) == event.target_c) == event.result
+                            )
+                            label = f"Sonar col {event.target_c + 1}"
+                        else:
+                            raw, label = b.valid_starts, ""
+                    else:  # drone
+                        icon = _ICON["drone"]
+                        if event.sector is not None and event.sector in ctx.sectors:
+                            sr, sc = ctx.sectors[event.sector]
+                            raw = frozenset(
+                                (r0, c0) for r0, c0 in b.valid_starts
+                                if (sr <= r0 - b.ry < sr + 5 and sc <= c0 + b.rx < sc + 5) == event.result
+                            )
+                            label = f"Drone sector {event.sector}"
+                        else:
+                            raw, label = b.valid_starts, ""
+                    if raw:
+                        nstarts = raw
+                    else:
+                        nstarts = b.valid_starts
+                        if label and not err:
+                            hit_str = "yes" if event.result else "no"
+                            err = f"Step {step}: {label} = {hit_str} contradicts known positions — constraint ignored."
+                    nodes.append({"x": b.rx, "y": b.ry, "step": step,
+                                  "fork_id": str(b.fork_id), "generation": str(b.generation), "ability": icon})
+                    new_branches.append(PathBranch(b.fork_id, b.generation, b.rx, b.ry, b.visited_relative, nstarts))
+                branches = new_branches
 
         return branches, nodes, edges, mine_dict, err
 
@@ -501,6 +566,18 @@ def _ui(get_archive, get_moves, set_archive, set_moves):
     torpedo_col    = mo.ui.number(start=1, stop=15, step=1, label="C:")
     surface_sector = mo.ui.number(start=1, stop=9,  step=1, label="Sec:")
 
+    # Sonar feedback (2 row/col hints)
+    sonar_type_1 = mo.ui.dropdown(options={"row": "Row", "col": "Col"}, value="row", label="")
+    sonar_val_1  = mo.ui.number(start=1, stop=15, step=1, label="")
+    sonar_hit_1  = mo.ui.switch(label="Hit?", value=True)
+    sonar_type_2 = mo.ui.dropdown(options={"row": "Row", "col": "Col"}, value="col", label="")
+    sonar_val_2  = mo.ui.number(start=1, stop=15, step=1, label="")
+    sonar_hit_2  = mo.ui.switch(label="Hit?", value=True)
+
+    # Drone feedback (1 sector hint)
+    drone_sector = mo.ui.number(start=1, stop=9, step=1, label="Sec:")
+    drone_hit    = mo.ui.switch(label="Hit?", value=True)
+
     def _do_surf(_):
         sec = int(surface_sector.value)
         archived_moves = list(get_moves()) + [{"type": "surface", "sector": sec}]
@@ -511,6 +588,22 @@ def _ui(get_archive, get_moves, set_archive, set_moves):
         tr = int(torpedo_row.value) - 1   # 1-based → 0-based
         tc = int(torpedo_col.value) - 1
         set_moves(get_moves() + [{"type": "fire", "name": "torpedo", "target_r": tr, "target_c": tc}])
+
+    def _do_sonar(_):
+        evs = []
+        for t, v, h in [
+            (sonar_type_1.value, int(sonar_val_1.value), bool(sonar_hit_1.value)),
+            (sonar_type_2.value, int(sonar_val_2.value), bool(sonar_hit_2.value)),
+        ]:
+            if t == "row":
+                evs.append({"type": "feedback", "name": "sonar", "target_r": v - 1, "result": h})
+            else:
+                evs.append({"type": "feedback", "name": "sonar", "target_c": v - 1, "result": h})
+        set_moves(get_moves() + evs)
+
+    def _do_drone(_):
+        set_moves(get_moves() + [{"type": "feedback", "name": "drone",
+                                   "sector": int(drone_sector.value), "result": bool(drone_hit.value)}])
 
     btn_N = mo.ui.button(label="⬆ N", on_click=lambda _: set_moves(get_moves() + [{"type": "move", "dir": "N"}]))
     btn_S = mo.ui.button(label="⬇ S", on_click=lambda _: set_moves(get_moves() + [{"type": "move", "dir": "S"}]))
@@ -525,9 +618,11 @@ def _ui(get_archive, get_moves, set_archive, set_moves):
     btn_drone   = mo.ui.button(label="🚁  Drone ",   kind="neutral", on_click=lambda _: set_moves(get_moves() + [{"type": "fire", "name": "drone"}]))
 
     # Action Buttons
-    btn_surface = mo.ui.button(label="🏄 Surface",    kind="warn",    on_click=_do_surf)
-    btn_undo    = mo.ui.button(label="↩ Undo",         kind="neutral", on_click=lambda _: set_moves(get_moves()[:-1]) if get_moves() else None)
-    btn_reset   = mo.ui.button(label="🔄 Full Reset",  kind="danger",  on_click=lambda _: (set_moves([]), set_archive([])))
+    btn_surface  = mo.ui.button(label="🏄 Surface",    kind="warn",    on_click=_do_surf)
+    btn_undo     = mo.ui.button(label="↩ Undo",         kind="neutral", on_click=lambda _: set_moves(get_moves()[:-1]) if get_moves() else None)
+    btn_reset    = mo.ui.button(label="🔄 Full Reset",  kind="danger",  on_click=lambda _: (set_moves([]), set_archive([])))
+    btn_log_sonar = mo.ui.button(label="Log", kind="neutral", on_click=_do_sonar)
+    btn_log_drone = mo.ui.button(label="Log", kind="neutral", on_click=_do_drone)
 
     # Apply styles inline during grouping so the base elements retain their pristine `.value` bindings
     torpedo_group = mo.hstack(
@@ -540,7 +635,7 @@ def _ui(get_archive, get_moves, set_archive, set_moves):
         align="center"
     )
 
-    surface_group = mo.hstack(
+    surface_group = mo.vstack(
         [
             btn_surface, 
             surface_sector.style(max_width="55px", padding="4px", text_align="center")
@@ -575,12 +670,45 @@ def _ui(get_archive, get_moves, set_archive, set_moves):
         align="center"
     )
 
+    sonar_group = mo.hstack(
+        [
+            mo.md("**📡 Sonar:**"),
+            mo.vstack([ 
+                sonar_type_1.style(min_width="70px"),
+                sonar_val_1.style(max_width="55px", padding="4px", text_align="center"),
+                sonar_hit_1,
+            ]),
+            mo.md("**·**"),
+            mo.vstack([
+                sonar_type_2.style(min_width="70px"),
+                sonar_val_2.style(max_width="55px", padding="4px", text_align="center"),
+                sonar_hit_2,
+            ]),
+            btn_log_sonar
+        ],
+        gap="0.5",
+        align="center",
+    )
+
+    drone_group = mo.hstack(
+        [
+            mo.md("**🚁 Drone:**"),
+            mo.vstack([
+                drone_sector.style(max_width="55px", padding="4px", text_align="center"),
+                drone_hit,
+            ]),
+            btn_log_drone,
+        ],
+        gap="0.5",
+        align="center",
+    )
+
     # Bottom layout, using the dynamically styled surface_group
     bottom_actions = mo.hstack(
-        [surface_group, btn_undo, btn_reset], 
-        gap="3", 
-        justify="center", 
-        align= "center"
+        [surface_group, btn_undo, btn_reset, mo.md("**|**"), sonar_group, mo.md("**|**"), drone_group],
+        gap="2",
+        justify="center",
+        align="center",
     )
 
     mo.vstack([
@@ -879,7 +1007,17 @@ def _move_log(get_archive, get_moves):
         if e["type"] == "move":
             _log.append({"#": i + 1, "Event": f"Move {e['dir']}", "Detail": ""})
         elif e["type"] == "surface":
-            _log.append({"#": i + 1, "Event": f"🏄 Surface", "Detail": f"Sector {e.get('sector', '?')}"})
+            _log.append({"#": i + 1, "Event": "🏄 Surface", "Detail": f"Sector {e.get('sector', '?')}"})
+        elif e["type"] == "feedback":
+            _hit = "✓ yes" if e.get("result") else "✗ no"
+            if e["name"] == "sonar":
+                if "target_r" in e:
+                    _detail = f"Row {e['target_r'] + 1} — {_hit}"
+                else:
+                    _detail = f"Col {e['target_c'] + 1} — {_hit}"
+                _log.append({"#": i + 1, "Event": "📡 Sonar result", "Detail": _detail})
+            else:
+                _log.append({"#": i + 1, "Event": "🚁 Drone result", "Detail": f"Sector {e.get('sector', '?')} — {_hit}"})
         else:
             icon = _ICONS.get(e["name"], e["name"])
             _detail = f"→ ({e['target_r'] + 1},{e['target_c'] + 1})" if e["name"] == "torpedo" and "target_r" in e else ""
